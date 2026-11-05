@@ -1,0 +1,166 @@
+#!/usr/bin/python3
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk
+
+SENSORS = Path("/sys/devices/platform/dell_smm_hwmon/hwmon")
+SYSTEM_OVERRIDE = Path("/usr/local/sbin/dell-fan-override")
+
+
+def read_fan():
+    sensor = next(SENSORS.glob("hwmon*"))
+    return tuple(
+        int((sensor / name).read_text())
+        for name in ("fan1_input", "fan1_max")
+    )
+
+
+def read_cpu_temperature():
+    for sensor in Path("/sys/class/hwmon").glob("hwmon*"):
+        try:
+            if (sensor / "name").read_text().strip() != "coretemp":
+                continue
+            for label in sensor.glob("temp*_label"):
+                if label.read_text().startswith("Package id"):
+                    reading = label.with_name(label.name.replace("_label", "_input"))
+                    return int(reading.read_text()) / 1000
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+STYLE = b"""
+.fan-window {
+    background-image: linear-gradient(to bottom right,
+        mix(@theme_bg_color, @theme_selected_bg_color, 0.16), @theme_bg_color);
+}
+.fan-title { font-size: 22px; font-weight: bold; }
+.fan-caption { color: mix(@theme_fg_color, @theme_bg_color, 0.25); }
+.fan-card {
+    background-color: mix(@theme_bg_color, @theme_base_color, 0.65);
+    border: 1px solid alpha(@theme_fg_color, 0.15);
+    border-radius: 16px;
+    padding: 16px;
+}
+.fan-value { font-size: 24px; font-weight: bold; }
+.fan-action { border-radius: 12px; padding: 10px 14px; }
+"""
+
+
+class FanWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Dell Fan Control")
+        self.set_default_size(460, 290)
+        self.connect("destroy", Gtk.main_quit)
+        self.get_style_context().add_class("fan-window")
+        provider = Gtk.CssProvider()
+        provider.load_from_data(STYLE)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        panel.set_border_width(20)
+        self.add(panel)
+
+        title = Gtk.Label(label="Dell Fan Control", xalign=0)
+        title.get_style_context().add_class("fan-title")
+        panel.pack_start(title, False, False, 0)
+
+        metrics = Gtk.Box(spacing=12, homogeneous=True)
+        panel.pack_start(metrics, False, False, 0)
+        self.reading, self.rating = self.add_metric(metrics, "Fan speed")
+        self.temperature, _ = self.add_metric(metrics, "CPU temperature")
+
+        self.buttons = Gtk.Box(spacing=10, homogeneous=True)
+        panel.pack_start(self.buttons, False, False, 0)
+        for label, mode in (("Automatic", "auto"), ("Full Speed", "full")):
+            button = Gtk.Button(label=label)
+            style = button.get_style_context()
+            style.add_class("fan-action")
+            if mode == "auto":
+                style.add_class("suggested-action")
+            button.connect("clicked", self.change_mode, mode)
+            self.buttons.pack_start(button, True, True, 0)
+
+        self.status = Gtk.Label(
+            label="Full Speed stays on until you choose Automatic.", xalign=0
+        )
+        self.status.get_style_context().add_class("fan-caption")
+        self.status.set_line_wrap(True)
+        panel.pack_start(self.status, False, False, 0)
+        self.refresh()
+        GLib.timeout_add_seconds(1, self.refresh)
+
+    def add_metric(self, row, title):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        card.get_style_context().add_class("fan-card")
+        row.pack_start(card, True, True, 0)
+        caption = Gtk.Label(label=title, xalign=0)
+        caption.get_style_context().add_class("fan-caption")
+        card.pack_start(caption, False, False, 0)
+        value = Gtk.Label(xalign=0)
+        value.get_style_context().add_class("fan-value")
+        card.pack_start(value, False, False, 0)
+        detail = Gtk.Label(xalign=0)
+        detail.get_style_context().add_class("fan-caption")
+        card.pack_start(detail, False, False, 0)
+        return value, detail
+
+    def refresh(self):
+        try:
+            rpm, maximum = read_fan()
+            self.reading.set_text(f"{rpm:,} RPM")
+            self.rating.set_text(f"Rated max: {maximum:,} RPM")
+        except (OSError, StopIteration, ValueError):
+            self.reading.set_text("—")
+            self.rating.set_text("Reading unavailable")
+        temperature = read_cpu_temperature()
+        self.temperature.set_text(
+            f"{temperature:.0f} °C" if temperature is not None else "—"
+        )
+        return GLib.SOURCE_CONTINUE
+
+    def change_mode(self, button, mode):
+        self.buttons.set_sensitive(False)
+        self.status.set_text("Applying fan setting…")
+        threading.Thread(target=self.apply_mode, args=(mode,), daemon=True).start()
+
+    def apply_mode(self, mode):
+        argument = {
+            "auto": "--automatic",
+            "full": "--hold-full",
+        }[mode]
+        try:
+            command = ["/usr/bin/sudo", "-n", str(SYSTEM_OVERRIDE), argument]
+            result = subprocess.run(command, capture_output=True, text=True)
+            if result.returncode:
+                message = result.stderr.strip() or "Could not apply the setting."
+            elif mode == "auto":
+                message = "The firmware accepted automatic control."
+            else:
+                message = "Full speed requested. Choose Automatic to return control to Dell."
+        except OSError:
+            message = "Could not start the fan control utility."
+        GLib.idle_add(self.finish, message)
+
+    def finish(self, message):
+        self.refresh()
+        self.status.set_text(message)
+        self.buttons.set_sensitive(True)
+        return GLib.SOURCE_REMOVE
+
+
+if __name__ == "__main__":
+    window = FanWindow()
+    if "--minimized" in sys.argv[1:]:
+        window.iconify()
+    window.show_all()
+    Gtk.main()
